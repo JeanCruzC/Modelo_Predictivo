@@ -1,69 +1,39 @@
 # -*- coding: utf-8 -*-
-"""Forecast Multimodelo con Streamlit"""
+"""Forecast Multimodelo con Streamlit y cache en AutoARIMA"""
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import warnings
 from io import BytesIO
-from math import sqrt
-from sklearn.metrics import mean_squared_error, mean_absolute_error
 from pmdarima import auto_arima
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBRegressor
 from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import GridSearchCV
 
-warnings.filterwarnings("ignore")
+# Supresión de warnings irrelevantes
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 st.title("Forecast Multimodelo con Streamlit")
 
-# --- Carga de datos -----------------------------------------------------
-uploaded = st.file_uploader(
-    "Sube tu archivo Excel o CSV con datos de serie temporal",
-    type=["xlsx", "csv"]
-)
-if not uploaded:
-    st.stop()
-if uploaded.name.endswith(".csv"):
-    df = pd.read_csv(uploaded)
-else:
-    df = pd.read_excel(uploaded)
-
-# --- Configuración de la columna de fechas -------------------------------
-col_fecha = st.text_input("Nombre de la columna de fechas", value="Fecha")
-if col_fecha not in df.columns:
-    st.error(
-        f"La columna '{col_fecha}' no existe. Columnas disponibles: {list(df.columns)}"
+# ------------------------------------------------------------
+# Cache para auto_arima: evita recalcular el mismo modelo
+# ------------------------------------------------------------
+@st.cache_resource
+def cached_auto_arima(series, seasonal, m):
+    return auto_arima(
+        series,
+        seasonal=seasonal,
+        m=m,
+        stepwise=True,
+        suppress_warnings=True
     )
-    st.stop()
 
-df[col_fecha] = pd.to_datetime(df[col_fecha], errors="coerce")
-df = df.set_index(col_fecha).ffill()
-
-# --- Definir horizontes --------------------------------------------------
-pasos_forecast = st.number_input(
-    "¿Cuántos pasos hacia adelante quieres pronosticar?",
-    min_value=1,
-    value=6
-)
-
-# --- Selección de modelos ------------------------------------------------
-all_models = [
-    "SARIMA", "ARIMA", "WES", "RandomForest", "XGBoost", "Stacking"
-]
-select_all = st.checkbox("Incluir todos los modelos", value=True)
-selected_models = (
-    all_models if select_all else st.multiselect(
-        "Selecciona modelos", all_models, default=all_models
-    )
-)
-if not selected_models:
-    st.error("Selecciona al menos un modelo.")
-    st.stop()
-
-# --- Funciones auxiliares ------------------------------------------------
+# === FUNCIONES AUXILIARES ===
 def detectar_frecuencia(series):
     freq = pd.infer_freq(series.index)
     if freq:
@@ -72,198 +42,176 @@ def detectar_frecuencia(series):
     days = diffs.dt.days.mean()
     return 'D' if days <= 1.5 else 'W' if days <= 8 else 'MS'
 
-def calcular_estacionalidad(data):
+ def calcular_estacionalidad(data):
     n = len(data)
-    if n >= 24: return 12
-    if n >= 18: return 6
-    if n >= 12: return 4
-    if n >= 8:  return 2
+    if n >= 24:
+        return 12
+    if n >= 18:
+        return 6
+    if n >= 12:
+        return 4
+    if n >= 8:
+        return 2
     return 1
 
-def aplicar_log(serie):
+ def aplicar_log(serie):
     if serie.std() / serie.mean() > 0.2:
         return np.log1p(serie), True
     return serie, False
 
-def walk_forward(train, test, seasonal, m):
+ def walk_forward(train, test, seasonal, m):
     history = train.copy()
     preds = []
     for t in range(len(test)):
         try:
-            model = auto_arima(
-                history, seasonal=seasonal, m=m,
-                stepwise=True, suppress_warnings=True
-            )
-            p = model.predict(n_periods=1)[0]
+            model = cached_auto_arima(history, seasonal, m)
+            arr = model.predict(n_periods=1)
+            p = arr.item() if hasattr(arr, 'item') else arr[0]
         except:
             p = history.iloc[-1]
         preds.append(p)
-        new_point = pd.Series([test.iloc[t]], index=[test.index[t]])
-        history = pd.concat([history, new_point])
+        next_pt = pd.Series([test.iloc[t]], index=[test.index[t]])
+        history = pd.concat([history, next_pt])
     return pd.Series(preds, index=test.index)
 
-def walk_forward_wes(train, test, m):
+ def walk_forward_wes(train, test, m):
     history = train.copy()
     preds = []
     for t in range(len(test)):
         try:
             model = ExponentialSmoothing(
                 history,
-                seasonal='add',
-                trend='add',
-                seasonal_periods=m
+                seasonal='add', trend='add', seasonal_periods=m
             ).fit()
-            p = model.forecast(1)[0]
+            arr = model.forecast(1)
+            p = arr.item() if hasattr(arr, 'item') else arr[0]
         except:
             p = history.iloc[-1]
         preds.append(p)
-        new_point = pd.Series([test.iloc[t]], index=[test.index[t]])
-        history = pd.concat([history, new_point])
+        next_pt = pd.Series([test.iloc[t]], index=[test.index[t]])
+        history = pd.concat([history, next_pt])
     return pd.Series(preds, index=test.index)
 
-def forecast_multimodelo(
-    data, m, freq, steps, rf_model, xgb_model,
-    ridge_model, selected_models
-):
+ def forecast_multimodelo(data, m, freq, steps, rf_model, xgb_model, ridge_model):
     fechas = pd.date_range(
         start=data.index[-1] + pd.tseries.frequencies.to_offset(freq),
         periods=steps, freq=freq
     )
     seasonal_flag = (m > 1 and len(data) >= 2*m)
-    sarima = auto_arima(
-        data, seasonal=seasonal_flag,
-        m=(m if seasonal_flag else 1),
-        stepwise=True, suppress_warnings=True
-    ).predict(n_periods=steps)
-    arima = auto_arima(
-        data, seasonal=False,
-        stepwise=True, suppress_warnings=True
-    ).predict(n_periods=steps)
+
+    # SARIMA
+    sarima_model = cached_auto_arima(data, seasonal_flag, m)
+    sarima_fc = sarima_model.predict(n_periods=steps)
+    # ARIMA no estacional
+    arima_model = cached_auto_arima(data, False, 0)
+    arima_fc = arima_model.predict(n_periods=steps)
+
+    # WES
     try:
-        wes = ExponentialSmoothing(
+        wes_fc = ExponentialSmoothing(
             data,
-            seasonal='add',
-            trend='add',
-            seasonal_periods=m
+            seasonal='add', trend='add', seasonal_periods=m
         ).fit().forecast(steps)
     except:
-        wes = np.repeat(data.iloc[-1], steps)
+        wes_fc = np.repeat(data.iloc[-1], steps)
 
-    # Generación de features para ML
+    # Features para ML
     hist = data.copy()
     feats = []
     for i in range(1, steps+1):
-        fecha = data.index[-1] + pd.tseries.frequencies.to_offset(freq) * i
+        dt = data.index[-1] + pd.tseries.frequencies.to_offset(freq)*i
         feats.append([
-            fecha.month,
-            fecha.dayofyear,
+            dt.month,
+            dt.dayofyear,
             hist.iloc[-1],
             hist.iloc[-2] if len(hist)>1 else hist.iloc[-1],
             hist.iloc[-3:].mean() if len(hist)>=3 else hist.iloc[-1]
         ])
-        hist = pd.concat([hist, pd.Series([hist.iloc[-1]], index=[fecha])])
-    Xf = pd.DataFrame(
-        feats,
-        columns=['Mes','DiaDelAnio','Lag1','Lag2','MediaMovil3'],
-        index=fechas
-    )
+        hist = pd.concat([hist, pd.Series([hist.iloc[-1]], index=[dt])])
+    Xf = pd.DataFrame(feats, columns=['Mes','DiaDelAnio','Lag1','Lag2','MediaMovil3'], index=fechas)
 
-    rf_pred = rf_model.predict(Xf) if 'RandomForest' in selected_models else None
-    xgb_pred = xgb_model.predict(Xf) if 'XGBoost' in selected_models else None
+    rf_fc  = rf_model.predict(Xf)
+    xgb_fc = xgb_model.predict(Xf)
 
-    # Stacking
-    stack_input = {}
-    if 'SARIMA'       in selected_models: stack_input['SARIMA'] = sarima
-    if 'ARIMA'        in selected_models: stack_input['ARIMA']  = arima
-    if 'WES'          in selected_models: stack_input['WES']    = wes
-    if 'RandomForest' in selected_models and rf_pred is not None:
-        stack_input['RandomForest'] = rf_pred
-    if 'XGBoost'      in selected_models and xgb_pred is not None:
-        stack_input['XGBoost'] = xgb_pred
+    df_stack = pd.DataFrame({
+        'SARIMA': sarima_fc,
+        'ARIMA':  arima_fc,
+        'WES':    wes_fc,
+        'RF':     rf_fc,
+        'XGB':    xgb_fc
+    }, index=fechas)
+    stk_fc = ridge_model.predict(df_stack)
 
-    df_stack = pd.DataFrame(stack_input, index=fechas)
-    stack = ridge_model.predict(df_stack) if 'Stacking' in selected_models else None
+    df_res = pd.DataFrame({
+        'SARIMA': sarima_fc,
+        'ARIMA':  arima_fc,
+        'WES':    wes_fc,
+        'RandomForest': rf_fc,
+        'XGBoost':      xgb_fc,
+        'Stacking':     stk_fc
+    }, index=fechas)
+    return df_res
 
-    results = dict(stack_input)
-    if 'Stacking' in selected_models:
-        results['Stacking'] = stack
-
-    return pd.DataFrame(results, index=fechas)
-
-# --- Preparación inicial ------------------------------------------------
-freq        = detectar_frecuencia(df.iloc[:,0])
-m           = calcular_estacionalidad(df.iloc[:,0])
-series, lf  = aplicar_log(df.iloc[:,0])
-if lf:
-    df.iloc[:,0] = series
-
-# --- División Train/Test ------------------------------------------------
-train = df.iloc[:int(len(df)*0.8), 0]
-test  = df.iloc[int(len(df)*0.8):, 0]
-
-# --- Tuning de modelos ML ------------------------------------------------
-rf_model, xgb_model = None, None
-ridge_model         = Ridge()
-
-if 'RandomForest' in selected_models:
-    rf = GridSearchCV(
-        RandomForestRegressor(random_state=42),
-        {'n_estimators':[100,200],'max_depth':[5,10,None]},
-        cv=3
-    )
-    rf.fit(train.to_frame(name='Valor'), train)
-    rf_model = rf
-
-if 'XGBoost' in selected_models:
-    xgb = GridSearchCV(
-        XGBRegressor(random_state=42),
-        {'n_estimators':[100,200],'learning_rate':[0.05,0.1]},
-        cv=3
-    )
-    xgb.fit(train.to_frame(name='Valor'), train)
-    xgb_model = xgb
-
-# --- Validación Walk-Forward --------------------------------------------
-wfv = pd.DataFrame(index=test.index)
-if 'SARIMA'       in selected_models:
-    wfv['SARIMA'] = walk_forward(train, test, seasonal=(m>1), m=m)
-if 'ARIMA'        in selected_models:
-    wfv['ARIMA']  = walk_forward(train, test, seasonal=False, m=m)
-if 'WES'          in selected_models:
-    wfv['WES']    = walk_forward_wes(train, test, m)
-
-st.subheader("Resultados Walk-Forward")
-if not wfv.empty:
-    st.line_chart(wfv)
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-        wfv.to_excel(writer, sheet_name='WFV')
-    st.download_button(
-        "Descargar Walk-Forward",
-        buf.getvalue(),
-        file_name="predicciones_walk_forward.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-# --- Pronóstico a futuro ------------------------------------------------
-if ('RandomForest' in selected_models and rf_model is None) or \
-   ('XGBoost'      in selected_models and xgb_model is None):
-    st.error("Falta tuning de ML para pronóstico futuro.")
+# === UI y lógica principal ===
+# Carga de archivo
+df_file = st.file_uploader("Sube Excel/CSV con serie temporal", type=["xlsx","csv"])
+if not df_file:
+    st.stop()
+if df_file.name.endswith(".csv"):
+    df0 = pd.read_csv(df_file)
 else:
-    fut = forecast_multimodelo(
-        df.iloc[:,0], m, freq, pasos_forecast,
-        rf_model, xgb_model, ridge_model, selected_models
-    )
-    if lf:
-        fut = np.expm1(fut)
-    st.subheader("Forecast Multimodelo")
-    st.line_chart(fut)
-    buf2 = BytesIO()
-    with pd.ExcelWriter(buf2, engine='openpyxl') as writer:
-        fut.to_excel(writer, sheet_name='Forecast')
-    st.download_button(
-        "Descargar Forecast",
-        buf2.getvalue(),
-        file_name="forecast_multimodelo.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    df0 = pd.read_excel(df_file)
+
+col_fecha = st.text_input("Columna de fechas", "Fecha")
+if col_fecha not in df0.columns:
+    st.error(f"Columna '{col_fecha}' no existe.")
+    st.stop()
+
+df0[col_fecha] = pd.to_datetime(df0[col_fecha], errors='coerce')
+df0.set_index(col_fecha, inplace=True)
+df0 = df0.ffill()
+
+steps = st.number_input("Pasos de forecast", min_value=1, value=6)
+models = ["SARIMA","ARIMA","WES","RandomForest","XGBoost","Stacking"]
+sel = st.multiselect("Modelos a usar", models, default=models)
+
+series = df0.iloc[:,0]
+freq = detectar_frecuencia(series)
+m = calcular_estacionalidad(series)
+series_adj, logf = aplicar_log(series)
+if logf: series = series_adj
+
+data_train = series.iloc[:int(len(series)*0.8)]
+data_test  = series.iloc[int(len(series)*0.8):]
+
+grid_rf = GridSearchCV(RandomForestRegressor(random_state=42), {'n_estimators':[100,200],'max_depth':[5,10,None]}, cv=2, n_jobs=-1)
+grid_rf.fit(data_train.to_frame('Valor'), data_train)
+rf_m = grid_rf
+
+grid_xgb = GridSearchCV(XGBRegressor(random_state=42), {'n_estimators':[100,200],'learning_rate':[0.05,0.1]}, cv=2, n_jobs=-1)
+grid_xgb.fit(data_train.to_frame('Valor'), data_train)
+xgb_m = grid_xgb
+
+ridge_m = Ridge()
+
+# Walk-Forward
+wf = pd.DataFrame(index=data_test.index)
+if 'SARIMA' in sel: wf['SARIMA'] = walk_forward(data_train.to_frame('Valor'), data_test.to_frame('Valor'), seasonal=(m>1), m=m)
+if 'ARIMA'  in sel: wf['ARIMA']  = walk_forward(data_train.to_frame('Valor'), data_test.to_frame('Valor'), seasonal=False, m=0)
+if 'WES'    in sel: wf['WES']    = walk_forward_wes(data_train.to_frame('Valor'), data_test.to_frame('Valor'), m)
+
+st.subheader("Validación Walk-Forward")
+st.line_chart(wf)
+buf1 = BytesIO()
+with pd.ExcelWriter(buf1, engine='openpyxl') as w: wf.to_excel(w, sheet_name='WFV')
+st.download_button("Descargar WFV", buf1.getvalue(), file_name='wfv.xlsx')
+
+# Forecast futuro
+fc = forecast_multimodelo(series, m, freq, steps, rf_m, xgb_m, ridge_m)
+if logf: fc = np.expm1(fc)
+
+st.subheader("Forecast futuro")
+st.line_chart(fc)
+buf2 = BytesIO()
+with pd.ExcelWriter(buf2, engine='openpyxl') as w: fc.to_excel(w, sheet_name='Forecast')
+st.download_button("Descargar Forecast", buf2.getvalue(), file_name='forecast.xlsx')
