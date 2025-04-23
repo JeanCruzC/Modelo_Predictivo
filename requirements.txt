@@ -1,8 +1,7 @@
-streamlit
-pandas
-numpy
+numpy==1.23.5
+scikit-build
+Cython
 pmdarima
 statsmodels
-scikit-learn
-xgboost
 openpyxl
+streamlit
