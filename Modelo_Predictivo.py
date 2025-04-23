@@ -56,12 +56,12 @@ def calcular_estacionalidad(series):
 
 def build_features(series):
     df = pd.DataFrame(index=series.index)
-    df["Valor"]        = series
-    df["Mes"]          = df.index.month
-    df["DiaDelAnio"]   = df.index.dayofyear
-    df["Lag1"]         = df["Valor"].shift(1)
-    df["Lag2"]         = df["Valor"].shift(2)
-    df["MediaMovil3"]  = df["Valor"].rolling(3).mean()
+    df["Valor"]       = series
+    df["Mes"]         = df.index.month
+    df["DiaDelAnio"]  = df.index.dayofyear
+    df["Lag1"]        = df["Valor"].shift(1)
+    df["Lag2"]        = df["Valor"].shift(2)
+    df["MediaMovil3"] = df["Valor"].rolling(3).mean()
     return df.dropna()
 
 # --------------------- Walk-forward helpers -----------------------
@@ -81,8 +81,7 @@ def walk_forward_wes(train, test, m):
     for idx in test.index:
         try:
             p = float(
-                ExponentialSmoothing(history, trend="add", seasonal="add",
-                                     seasonal_periods=m)
+                ExponentialSmoothing(history, trend="add", seasonal="add", seasonal_periods=m)
                 .fit()
                 .forecast(1)[0]
             )
@@ -100,11 +99,26 @@ def forecast_multimodelo(series, m, freq, steps, rf_model, xgb_model):
     )
     seasonal_flag = m > 1 and len(series) >= 2*m
 
-    sarima_fc = cached_auto_arima(series, seasonal_flag, m).predict(steps).astype(float)
-    arima_fc  = cached_auto_arima(series, False, 0).predict(steps).astype(float)
+    # SARIMA
     try:
-        wes_fc = ExponentialSmoothing(series, trend="add", seasonal="add",
-                                      seasonal_periods=m).fit().forecast(steps).astype(float)
+        sarima_fc = cached_auto_arima(series, seasonal_flag, m).predict(steps).astype(float)
+    except Exception:
+        sarima_fc = np.repeat(float(series.iloc[-1]), steps)
+
+    # ARIMA (no estacional)
+    try:
+        arima_fc = cached_auto_arima(series, False, 0).predict(steps).astype(float)
+    except Exception:
+        arima_fc = np.repeat(float(series.iloc[-1]), steps)
+
+    # WES
+    try:
+        wes_fc = (
+            ExponentialSmoothing(series, trend="add", seasonal="add", seasonal_periods=m)
+            .fit()
+            .forecast(steps)
+            .astype(float)
+        )
     except Exception:
         wes_fc = np.repeat(float(series.iloc[-1]), steps)
 
@@ -119,7 +133,7 @@ def forecast_multimodelo(series, m, freq, steps, rf_model, xgb_model):
 
     Xf = pd.DataFrame(
         feats,
-        columns=["Mes","DiaDelAnio","Lag1","Lag2","MediaMovil3"],
+        columns=["Mes", "DiaDelAnio", "Lag1", "Lag2", "MediaMovil3"],
         index=fechas
     )
 
@@ -143,12 +157,14 @@ st.title("Forecast Multimodelo – XLSX como en Colab")
 
 uploaded = st.file_uploader(
     "Sube tu archivo Excel o CSV (Fecha, Valor)",
-    type=["xlsx","xls","csv"]
+    type=["xlsx", "xls", "csv"]
 )
+
 steps_horizon = st.number_input(
     "Pasos futuros a pronosticar",
     min_value=1, max_value=60, value=6, step=1
 )
+
 if not uploaded:
     st.stop()
 
@@ -158,36 +174,36 @@ raw = (
     if uploaded.name.endswith(("xlsx","xls"))
     else pd.read_csv(uploaded)
 )
-raw.iloc[:,0] = pd.to_datetime(raw.iloc[:,0], errors="coerce")
+raw.iloc[:, 0] = pd.to_datetime(raw.iloc[:, 0], errors="coerce")
 raw.set_index(raw.columns[0], inplace=True)
-series = raw.iloc[:,0].ffill()
+series = raw.iloc[:, 0].ffill()
 
 freq = detectar_frecuencia(series)
 m    = calcular_estacionalidad(series)
 
 # ---------- Features ML --------------------------------------------
 feat_df = build_features(series)
-X_all   = feat_df[["Mes","DiaDelAnio","Lag1","Lag2","MediaMovil3"]]
+X_all   = feat_df[["Mes", "DiaDelAnio", "Lag1", "Lag2", "MediaMovil3"]]
 y_all   = feat_df["Valor"]
 
-split = int(len(X_all)*0.8)
+split = int(len(X_all) * 0.8)
 X_train, X_test = X_all.iloc[:split], X_all.iloc[split:]
 y_train, y_test = y_all.iloc[:split], y_all.iloc[split:]
 
 rf  = GridSearchCV(
     RandomForestRegressor(random_state=42),
-    {"n_estimators":[100,200], "max_depth":[5,None]},
+    {"n_estimators": [100, 200], "max_depth": [5, None]},
     cv=3
 ).fit(X_train, y_train)
 
 xgb = GridSearchCV(
     XGBRegressor(random_state=42, verbosity=0),
-    {"n_estimators":[100], "learning_rate":[0.05]},
+    {"n_estimators": [100], "learning_rate": [0.05]},
     cv=3
 ).fit(X_train, y_train)
 
-rf_pred   = rf.predict(X_test).astype(float)
-xgb_pred  = xgb.predict(X_test).astype(float)
+rf_pred    = rf.predict(X_test).astype(float)
+xgb_pred   = xgb.predict(X_test).astype(float)
 stack_pred = (rf_pred + xgb_pred) / 2
 
 # ---------- Walk-forward -------------------------------------------
@@ -195,14 +211,14 @@ train_series = series.iloc[:split]
 test_series  = series.iloc[split:]
 
 arima_wf  = walk_forward(train_series, test_series, seasonal=False, m=0)
-sarima_wf = walk_forward(train_series, test_series, seasonal=(m>1), m=m)
+sarima_wf = walk_forward(train_series, test_series, seasonal=(m > 1), m=m)
 wes_wf    = walk_forward_wes(train_series, test_series, m)
 
 wf_df = pd.DataFrame({
-    "Real":        test_series.values,
-    "ARIMA_WFV":   arima_wf.values,
-    "SARIMA_WFV":  sarima_wf.values,
-    "WES_WFV":     wes_wf.values
+    "Real":       test_series.values,
+    "ARIMA_WFV":  arima_wf.values,
+    "SARIMA_WFV": sarima_wf.values,
+    "WES_WFV":    wes_wf.values
 }, index=test_series.index)
 
 ml_df = pd.DataFrame({
@@ -216,8 +232,8 @@ ml_df = pd.DataFrame({
 rmse = lambda y_true, y_pred: np.sqrt(mean_squared_error(y_true, y_pred))
 metricas = pd.DataFrame({
     "Modelo": [
-        "ARIMA_WFV","SARIMA_WFV","WES_WFV",
-        "RandomForest","XGBoost","Stacking"
+        "ARIMA_WFV", "SARIMA_WFV", "WES_WFV",
+        "RandomForest", "XGBoost", "Stacking"
     ],
     "RMSE": [
         rmse(test_series, arima_wf),
