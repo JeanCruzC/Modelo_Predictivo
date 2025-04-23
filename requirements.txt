@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+pmdarima
+statsmodels
+scikit-learn
+xgboost
+openpyxl
