@@ -5,3 +5,5 @@ pmdarima
 statsmodels
 openpyxl
 streamlit
+xgboost
+
