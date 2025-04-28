@@ -62,7 +62,7 @@ if uploaded_file:
 
     st.write(f"Datos cargados: {len(series)} registros.")
 
-    steps_horizon = st.number_input("¿Cuántos pasos futuros deseas pronosticar?", min_value=1, max_value=24, value=6)
+    steps_horizon = st.number_input("¿Cuántos pasos futuros deseas pronosticar?", min_value=1, max_value=200, value=6)
 
     if st.button("Ejecutar Pronóstico"):
         st.write("Iniciando detección de frecuencia y estacionalidad...")
